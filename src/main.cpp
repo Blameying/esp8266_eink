@@ -1,39 +1,46 @@
+#define USE_HSPI_FOR_EPD
+#define ESP32
 #define ENABLE_GxEPD2_GFX 0
 
 #include <GxEPD2_3C.h>
 #include "hu16pt7b.h"
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include <WiFiClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <FS.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <ESP8266WebServer.h>
 #include "config.h"
 
-#define PIN_SPI_SCK 14
-#define PIN_SPI_DIN 13
+#define PIN_SPI_SCK 13
+#define PIN_SPI_DIN 14
 #define CS_PIN 15
-#define RST_PIN 2
-#define DC_PIN 4
-#define BUSY_PIN 5
+#define RST_PIN 26
+#define DC_PIN 27
+#define BUSY_PIN 25
+
 
 // 定义墨水屏对象
 #define GxEPD2_DISPLAY_CLASS GxEPD2_3C
 #define GxEPD2_DRIVER_CLASS GxEPD2_420c
-#define MAX_DISPLAY_BUFFER_SIZE (81920ul-34000ul-10000ul)
+#define MAX_DISPLAY_BUFFER_SIZE 65536ul // e.g.
 #define MAX_HEIGHT(EPD) (EPD::HEIGHT <= (MAX_DISPLAY_BUFFER_SIZE / 2) / (EPD::WIDTH / 8) ? EPD::HEIGHT : (MAX_DISPLAY_BUFFER_SIZE / 2) / (EPD::WIDTH / 8))
 GxEPD2_DISPLAY_CLASS<GxEPD2_DRIVER_CLASS, MAX_HEIGHT(GxEPD2_DRIVER_CLASS)> display(GxEPD2_DRIVER_CLASS(CS_PIN, DC_PIN, RST_PIN, BUSY_PIN));
 
+#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
+SPIClass hspi(HSPI);
+#endif
+
 bool access_locked = false;
+bool connected = false;
 /* Put IP Address details in AP mode */
 IPAddress local_ip(192,168,1,1);
 IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
-ESP8266WebServer server(80);
+WebServer server(80);
 
 
 WiFiClient client;
@@ -112,7 +119,16 @@ bool connect_wifi(const char *ssid, const char *passwd) {
 }
 
 void start_server() {
-    server.serveStatic("/", LittleFS, "/index.html");
+    // 修正为手动处理：
+    server.on("/", HTTP_GET, []() {
+        File file = LittleFS.open("/index.html", "r");
+        if (file) {
+            server.streamFile(file, "text/html");
+            file.close();
+        } else {
+            server.send(500, "text/plain", "File not found");
+        }
+    });
     server.on("/wifi", HTTP_POST, [](){
         if (access_locked) {
             server.send(403, "text/plain", "Please wait for a while and retry.");
@@ -144,21 +160,22 @@ void setup() {
     Serial.begin(115200); // 初始化串口
     Serial.println("Initializing...");
 
+#if defined(ESP32) && defined(USE_HSPI_FOR_EPD)
+    hspi.begin(13, 12, 14, 15); // remap hspi for EPD (swap pins)
+    display.epd2.selectSPI(hspi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+#else
     pinMode(PIN_SPI_SCK, OUTPUT);
     pinMode(PIN_SPI_DIN, OUTPUT);
     pinMode(CS_PIN , OUTPUT);
     pinMode(RST_PIN , OUTPUT);
     pinMode(DC_PIN , OUTPUT);
     pinMode(BUSY_PIN, INPUT);
-
+#endif
     if (!LittleFS.begin()) {
         Serial.println("An Error has occurred while mounting LittleFS");
         return;
     }
 
-    start_server();
-
-    bool connected = false;
     WiFi.mode(WIFI_STA);
     if (!connect_wifi(ssid, password)) {
         delay(1000);
@@ -168,11 +185,18 @@ void setup() {
         } else {
             String json = f.readString();
             Serial.println(json);
-            JsonDocument doc;
-            deserializeJson(doc, json);
-            const char *ssid = doc["ssid"];
-            const char *passwd = doc["password"];
-            connected = connect_wifi(ssid, passwd);
+            if (json.length() != 0) {
+                JsonDocument doc;
+                DeserializationError error = deserializeJson(doc, json);
+                if (error == DeserializationError::Ok) {
+                    const char *ssid = doc["ssid"];
+                    const char *passwd = doc["password"];
+                    connected = connect_wifi(ssid, passwd);
+                } else {
+                    Serial.println("Failed to parse wifi.json");
+                }
+            }
+            
             if (!connected) {
                 Serial.println("Failed to connect to WiFi from wifi.json");
             }
@@ -182,12 +206,15 @@ void setup() {
         if (!connected) {
             Serial.println("Try to set up WiFi from AP mode");
             WiFi.mode(WIFI_AP);
-            WiFi.softAP("ESP8266", "12345678");
+            WiFi.softAP("Eink", "12345678");
             WiFi.softAPConfig(local_ip, gateway, subnet);
             delay(100);
-            return;
         }
+    } else {
+        connected = true;
     }
+
+    start_server();
 
     timeClient.begin();
     timeClient.update();
@@ -215,20 +242,22 @@ void setup() {
 void loop() {
     // 每小时更新一次数据
     server.handleClient();
-    delay(1000);
-    timeClient.update();
-    if (timeClient.getMinutes() == 0) {
-        display.firstPage();
-        do {
-            display.fillScreen(GxEPD_WHITE); // 清空屏幕
-            fetch_data();
-            Serial.printf("image_updated flag: %d\n", image_updated);
-            if (!image_updated) {
+    if (connected) {
+        delay(1000);
+        timeClient.update();
+        if (timeClient.getMinutes() == 0) {
+            display.firstPage();
+            do {
                 display.fillScreen(GxEPD_WHITE); // 清空屏幕
-                display.setCursor(160, 120);
-                display.print("No signal!");
-            }
-        } while (display.nextPage()); // 结束当前页并检查是否需要渲染下一页
-        delay(1000*60); // 延时 1 分钟
+                fetch_data();
+                Serial.printf("image_updated flag: %d\n", image_updated);
+                if (!image_updated) {
+                    display.fillScreen(GxEPD_WHITE); // 清空屏幕
+                    display.setCursor(160, 120);
+                    display.print("No signal!");
+                }
+            } while (display.nextPage()); // 结束当前页并检查是否需要渲染下一页
+            delay(1000*60); // 延时 1 分钟
+        }
     }
 }
